@@ -5,7 +5,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 
-TOKEN = getenv("8679179719:AAG1ZGKS7OpaKutaao9iS6HdFkTFaRXERPE")
+TOKEN = getenv("BOT_TOKEN")
 
 dp = Dispatcher()
 
@@ -20,4 +20,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
