@@ -1,15 +1,18 @@
 import asyncio
 import logging
-import sys
 import tempfile
 from pathlib import Path
 from os import getenv
-from typing import Any
+
+from dotenv import load_dotenv
+
+load_dotenv()  # Загружаем переменные окружения из .env файла
 
 from aiogram import Bot, Dispatcher, F, Router, html
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandStart
+from aiogram.fsm.storage.redis import RedisStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -20,7 +23,15 @@ from aiogram.types import (
     FSInputFile,
 )
 
+from db import (
+    init_db,
+    get_user_by_telegram_id,
+    save_user_name,
+    save_user_profile,
+)
+
 TOKEN = getenv("BOT_TOKEN")
+REDIS_URL = getenv("REDIS_URL")
 
 dialog_router = Router()
 
@@ -39,11 +50,26 @@ class Dialog(StatesGroup):
 # Обработчик запросов
 @dialog_router.message(CommandStart())
 async def command_start_handler(message: Message, state: FSMContext) -> None:
-    await state.set_state(Dialog.ask_name)
-    await message.answer(
-        "Приветствую! Как мне к вам обращаться?",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await state.clear()  # Очищаем состояние пользователя при старте
+
+    if message.from_user is None:
+        return
+
+    user = await get_user_by_telegram_id(message.from_user.id)
+
+    if user and user.name:
+        await state.set_state(Dialog.main_menu)
+
+        await message.answer(
+            f"Здравствуйте, {html.quote(user.name)}! Выберите действие:",
+            reply_markup=main_menu_keyboard(),
+        )
+    else:
+        await state.set_state(Dialog.ask_name)
+        await message.answer(
+            "Приветствую! Как мне к вам обращаться?",
+            reply_markup=ReplyKeyboardRemove(),
+        )
 
 
 def main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -60,10 +86,20 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
 
 @dialog_router.message(Dialog.ask_name, F.text)
 async def process_name(message: Message, state: FSMContext) -> None:
-    name = message.text.strip()
-    await state.update_data(name=name)
+    if message.from_user is None:
+        return
 
+    name = message.text.strip()
+
+    if not name:
+        await message.answer("Имя не может быть пустым. Попробуйте ещё раз.")
+        return
+
+    await save_user_name(message.from_user.id, name)
+
+    await state.update_data(name=name)
     await state.set_state(Dialog.main_menu)
+
     await message.answer(
         f"Приятно познакомиться, {html.quote(message.text)}! Выберите действие:",
         reply_markup=main_menu_keyboard(),
@@ -88,7 +124,10 @@ async def conversion_handler(message: Message, state: FSMContext) -> None:
 @dialog_router.message(Dialog.func_docx, F.document)
 async def convert_docx_handler(message: Message, state: FSMContext) -> None:
     document = message.document
-    if not document.file_name.endswith(".docx"):
+
+    file_name = document.file_name or ""
+
+    if not file_name.lower().endswith(".docx"):
         await message.answer("Пожалуйста, отправьте файл с расширением .docx")
         return
 
@@ -119,7 +158,7 @@ async def convert_docx_handler(message: Message, state: FSMContext) -> None:
                 caption="Готово! Ваш файл был успешно конвертирован в PDF.",
             )
     except ImportError:
-        logging.expectation("Conversion error")
+        logging.exception("Conversion error")
         await status_message.edit_text(
             "Не установлена библиотека для конвертации.\n"
             "Выполните: pip install docx2pdf"
@@ -159,30 +198,69 @@ async def registration_handler(message: Message, state: FSMContext) -> None:
     )
 
 
-@dialog_router.message(Dialog.reg_birth_date)
+@dialog_router.message(Dialog.reg_birth_date, F.text)
 async def process_birth_date(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+
     birth_date = message.text.strip()
+
+    if not birth_date:
+        await message.answer("Дата рождения не может быть пустой.")
+        return
+
     await state.update_data(birth_date=birth_date)
 
     await state.set_state(Dialog.reg_gender)
     await message.answer("Укажите ваш пол")
 
 
-@dialog_router.message(Dialog.reg_gender)
+@dialog_router.message(Dialog.reg_gender, F.text)
 async def process_gender(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+
     gender = message.text.strip()
+
+    if not gender:
+        await message.answer("Пол не может быть пустым.")
+        return
+
     await state.update_data(gender=gender)
 
     await state.set_state(Dialog.reg_address)
     await message.answer("Укажите ваш адрес")
 
 
-@dialog_router.message(Dialog.reg_address)
+@dialog_router.message(Dialog.reg_address, F.text)
 async def process_address(message: Message, state: FSMContext) -> None:
+    if message.from_user is None:
+        return
+
     address = message.text.strip()
+
+    if not address:
+        await message.answer("Адрес не может быть пустым.")
+        return
+
     await state.update_data(address=address)
 
     data = await state.get_data()
+
+    await save_user_profile(
+        telegram_id=message.from_user.id,
+        birth_date=data.get("birth_date", ""),
+        gender=data.get("gender", ""),
+        address=address,
+    )
+
+    user = await get_user_by_telegram_id(message.from_user.id)
+
+    name = ""
+    if user and user.name:
+        name = user.name
+    else:
+        name = data.get("name", "")
 
     await state.set_state(Dialog.main_menu)
 
@@ -190,19 +268,32 @@ async def process_address(message: Message, state: FSMContext) -> None:
         f"""
 Ваш профиль сохранен.
 
-Имя: {data.get("name")} 
-Дата рождения: {data.get("birth_date")}
-Пол: {data.get("gender")}
-Адрес: {data.get("address")}
+Имя: {html.quote(name)}
+Дата рождения: {html.quote(data.get("birth_date", ""))}
+Пол: {html.quote(data.get("gender", ""))}
+Адрес: {html.quote(address)}
         """,
         reply_markup=main_menu_keyboard(),
     )
 
 
 async def main() -> None:
-    bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher()
+    logging.basicConfig(level=logging.INFO)
+
+    await init_db()  # Инициализация базы данных
+
+    bot = Bot(
+        token=TOKEN,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    storage = RedisStorage.from_url(
+        REDIS_URL
+    )  # Используем Redis для хранения состояния
+
+    dp = Dispatcher(storage=storage)
     dp.include_router(dialog_router)
+
     await dp.start_polling(bot)
 
 
